@@ -1,0 +1,9 @@
+# Node modules
+node_modules/
+
+# Build directories
+assets/js/
+assets/css/
+
+# Log files
+*.changelog
