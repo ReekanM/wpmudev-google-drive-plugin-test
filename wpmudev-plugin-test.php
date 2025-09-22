@@ -40,6 +40,10 @@ if ( ! defined( 'WPMUDEV_PLUGINTEST_ASSETS_URL' ) ) {
     define( 'WPMUDEV_PLUGINTEST_ASSETS_URL', WPMUDEV_PLUGINTEST_URL . 'assets' );
 }
 
+// Load WP-CLI command
+if ( defined( 'WP_CLI' ) && WP_CLI ) {
+    require_once plugin_dir_path( __FILE__ ) . 'app/class-wpmudev-posts-cli.php';
+}
 
 /**
  * Main plugin class
@@ -70,9 +74,12 @@ class WPMUDEV_PluginTest {
 
         // Init Google Drive API
         $this->init_google_drive_api();
+        $this->init_posts_maintenance_api();
 
-        // Enqueue admin scripts
+       // Hooks
+        add_action( 'admin_menu', [ $this, 'register_admin_pages' ] );
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_drive_script' ] );
+        add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_posts_maintenance_script' ] );
     }
 
     private function init_google_drive_api(): void {
@@ -81,6 +88,35 @@ class WPMUDEV_PluginTest {
             $drive_api = \WPMUDEV\PluginTest\Endpoints\V1\Drive_API::instance();
             $drive_api->init();
         }
+    }
+
+    private function init_posts_maintenance_api(): void {
+        require_once WPMUDEV_PLUGINTEST_DIR . 'app/endpoints/v1/class-posts-maintenance-rest.php';
+    }
+
+    /**
+     * Register admin page Posts Maintenance
+     */
+    public function register_admin_pages(): void {
+
+        // Posts Maintenance page
+        add_menu_page(
+            __( 'Posts Maintenance', 'wpmudev-plugin-test' ),
+            __( 'Posts Maintenance', 'wpmudev-plugin-test' ),
+            'manage_options',
+            'wpmudev-posts-maintenance',
+            [ $this, 'render_posts_maintenance_page' ],
+            'dashicons-admin-tools',
+            65
+        );
+    }
+    
+     /**
+     * Output container for Posts Maintenance React app
+     */
+    public function render_posts_maintenance_page(): void {
+        echo '<div class="wrap"><h1>' . esc_html__( 'Posts Maintenance', 'wpmudev-plugin-test' ) . '</h1>';
+        echo '<div id="wpmudev-posts-maintenance-app"></div></div>';
     }
 
     /**
@@ -107,6 +143,74 @@ class WPMUDEV_PluginTest {
             ]
         );
     }
+
+     /**
+     * Enqueue Posts Maintenance admin script only on its screen
+     */
+    public function enqueue_posts_maintenance_script( $hook = '' ): void {
+        if ( 'toplevel_page_wpmudev-posts-maintenance' !== $hook ) {
+            return;
+        }
+
+        $script_path = WPMUDEV_PLUGINTEST_DIR . 'assets/js/postsmaintenance.min.js';
+        $style_path  = WPMUDEV_PLUGINTEST_DIR . 'assets/css/postsmaintenance.min.css';
+
+        if ( ! file_exists( $script_path ) ) {
+            return;
+        }
+
+        wp_enqueue_script(
+            'wpmudev-posts-maintenance',
+            WPMUDEV_PLUGINTEST_URL . 'assets/js/postsmaintenance.min.js',
+            [ 'wp-element', 'wp-components' ],
+            filemtime( $script_path ),
+            true
+        );
+
+        if ( file_exists( $style_path ) ) {
+            wp_enqueue_style(
+                'wpmudev-posts-maintenance',
+                WPMUDEV_PLUGINTEST_URL . 'assets/css/postsmaintenance.min.css',
+                [],
+                filemtime( $style_path )
+            );
+        }
+
+        // gather public post types (objects so we can get labels)
+        $available_post_types = get_post_types( [ 'public' => true ], 'objects' );
+
+        // remove attachments (media) if present
+        if ( isset( $available_post_types['attachment'] ) ) {
+            unset( $available_post_types['attachment'] );
+        }
+
+        // build slug => label map for JS
+        $post_types = [];
+        foreach ( $available_post_types as $slug => $obj ) {
+            // Try singular_name, then label, then fallback to slug
+            if ( isset( $obj->labels ) && ! empty( $obj->labels->singular_name ) ) {
+                $label = $obj->labels->singular_name;
+            } elseif ( ! empty( $obj->label ) ) {
+                $label = $obj->label;
+            } else {
+                $label = $slug;
+            }
+
+            $post_types[ $slug ] = $label;
+        }
+
+        wp_localize_script(
+            'wpmudev-posts-maintenance',
+            'wpmudevPostsMaintenance',
+            [
+                'root'              => esc_url_raw( rest_url() ),
+                'nonce'             => wp_create_nonce( 'wp_rest' ),
+                'availablePostTypes'=> $post_types,
+                'defaultBatchSize'  => 50,
+            ]
+        );
+
+    }
 }
 
 // Initialize the plugin
@@ -119,19 +223,24 @@ register_activation_hook( __FILE__, function() {
     flush_rewrite_rules();
 } );
 
-if (!wp_next_scheduled('wpmudev_daily_posts_scan')) {
-    wp_schedule_event(time(), 'daily', 'wpmudev_daily_posts_scan');
-}
-
-add_action('wpmudev_daily_posts_scan', function() {
-    $post_types = ['post','page'];
-    foreach($post_types as $pt){
-        $query = new WP_Query(['post_type'=>$pt,'post_status'=>'publish','posts_per_page'=>-1]);
-        foreach($query->posts as $post) {
-            update_post_meta($post->ID, 'wpmudev_test_last_scan', current_time('mysql'));
-        }
+// Posts Maintenance - Daily Scan //
+// Schedule wrapper that starts a scan daily (if not scheduled)
+register_activation_hook( WPMUDEV_PLUGINTEST_PLUGIN_FILE, function() {
+    if ( ! wp_next_scheduled( 'wpmudev_daily_posts_scan_wrapper' ) ) {
+        wp_schedule_event( time(), 'daily', 'wpmudev_daily_posts_scan_wrapper' );
     }
-});
-register_deactivation_hook(__FILE__, function() {
-    wp_clear_scheduled_hook('wpmudev_daily_posts_scan');
-});
+} );
+
+add_action( 'wpmudev_daily_posts_scan_wrapper', function() {
+    // we programmatically call the start scan function to create a background job
+    // Use the same default post types (post, page). We call the function directly
+    $request = new WP_REST_Request( 'POST', '/wpmudev/v1/posts-scan/start' );
+    $request->set_body_params( [ 'post_types' => [ 'post', 'page' ], 'batch_size' => 100 ] );
+    // Bypass permissions since CRON runs in background, but ensure proper checks inside function if needed.
+    wpmudev_posts_scan_start( $request );
+} );
+
+// Clear on deactivation
+register_deactivation_hook( WPMUDEV_PLUGINTEST_PLUGIN_FILE, function() {
+    wp_clear_scheduled_hook( 'wpmudev_daily_posts_scan_wrapper' );
+} );
