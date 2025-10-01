@@ -1,6 +1,6 @@
-# WPMUDEV Test Plugin #
+# Google Drive Test Plugin #
 
-This is a plugin that can be used for testing coding skills for WordPress and PHP.
+This is a plugin that can be used for testing coding skills for WordPress, React, and PHP.
 
 # Development
 
